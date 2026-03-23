@@ -33,3 +33,8 @@ class EStop:
             self._logger.warn(f'EStop triggered')
             cmd.drive.speed = 0.0
         return cmd
+    
+    
+    
+    
+    
