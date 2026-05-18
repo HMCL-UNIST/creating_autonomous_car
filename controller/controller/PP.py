@@ -8,8 +8,6 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from visualization_msgs.msg import Marker
 from f110_msgs.msg import WpntArray
 
-from controller.estop import EStop
-
 PARAMS = {
     'control_rate_hz': 50.0,
     'pp_lookahead':     1.0,
@@ -27,12 +25,10 @@ class PPNode(Node):
             self.declare_parameter(name, default)
         p = lambda name: self.get_parameter(name).value
 
-        self.estop     = EStop(self)
         self.lookahead = p('pp_lookahead')
         self.wheelbase = p('pp_wheelbase')
         self.max_steer = p('pp_max_steer')
 
-        self.scan      = None
         self.odom      = None
         self.waypoints = []
 
@@ -42,8 +38,6 @@ class PPNode(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
         )
 
-        from sensor_msgs.msg import LaserScan
-        self.create_subscription(LaserScan,  '/scan',             self._scan_cb, 10)
         self.create_subscription(Odometry,   '/vesc/odom',        self._odom_cb, 10)
         self.create_subscription(WpntArray,  '/global_waypoints', self._wp_cb, latched)
         self.drive_pub     = self.create_publisher(AckermannDriveStamped, '/vesc/high_level/ackermann_cmd', 10)
@@ -52,7 +46,6 @@ class PPNode(Node):
 
         self.get_logger().info('PPNode ready')
 
-    def _scan_cb(self, msg): self.scan = msg
     def _odom_cb(self, msg): self.odom = msg
     def _wp_cb(self, msg):   self.waypoints = msg.wpnts
 
