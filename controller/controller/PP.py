@@ -85,9 +85,6 @@ class PPNode(Node):
         msg.drive.steering_angle = steer
         msg.drive.speed = speed
 
-        if self.scan is not None:
-            msg = self.estop.should_stop(self.scan, self.odom, msg)
-
         self.drive_pub.publish(msg)
 
     def _compute(self):
