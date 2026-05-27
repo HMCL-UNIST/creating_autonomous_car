@@ -721,11 +721,7 @@ class LocalPlanning(Node):
     # Visualization
     # ================================================================== #
     def _publish_local_markers(self, wpnts, mode):
-        color = {
-            'free':         (0.3, 0.8, 1.0),   # sky blue
-            'trailing':     (1.0, 1.0, 0.2),   # yellow
-            'spline_avoid': (1.0, 0.4, 0.1),   # orange
-        }.get(mode, (0.3, 0.8, 1.0))
+        color = (0.3, 0.8, 1.0)   # sky blue (always)
         ma = MarkerArray()
         line = Marker()
         line.header.frame_id = 'map'
@@ -737,9 +733,11 @@ class LocalPlanning(Node):
         line.pose.orientation.w = 1.0
         line.scale.x = 0.08
         line.color.r, line.color.g, line.color.b, line.color.a = (*color, 1.0)
+        # z above candidate (0.07) and global raceline so the local path
+        # always draws on top in RViz.
         for w in wpnts.wpnts:
             p = Point()
-            p.x, p.y, p.z = float(w.x_m), float(w.y_m), 0.05
+            p.x, p.y, p.z = float(w.x_m), float(w.y_m), 0.20
             line.points.append(p)
         ma.markers.append(line)
         self.marker_pub.publish(ma)
