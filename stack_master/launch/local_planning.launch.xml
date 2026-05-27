@@ -33,8 +33,8 @@
        default="$(find-pkg-share stack_master)/config/local_planning.yaml"
        description="YAML file with local_planning tunable parameters"/>
   <arg name="planner_path"
-       default="/ws/src/creating_autonomous_car/planner/planner/local_planning.py"
-       description="Path to the local_planning python file"/>
+       default="$(env COLCON_PREFIX_PATH)/../src/creating_autonomous_car/planner/planner/local_planning.py"
+       description="Path to the local_planning python file (resolved from workspace install dir)"/>
 
   <!-- 1. Publish global raceline from stack_master/maps/<map>/global_waypoints.csv -->
   <node pkg="planner" exec="waypoint_publisher" name="waypoint_publisher" output="screen">

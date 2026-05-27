@@ -174,7 +174,6 @@ def trailing(track, ego, ego_v) -> float:
 # ===========================================================================
 #  GEOMETRY HELPER (provided)
 # ===========================================================================
-
 def geom_psi_kappa(x: np.ndarray, y: np.ndarray):
     """Heading & signed curvature of a non-closed (x, y) sequence."""
     n = len(x)
@@ -236,6 +235,10 @@ class LocalPlanning(Node):
         # opponents whose tracked |v| exceeds this are treated as dynamic and
         # routed to trailing only (no spline avoidance).
         self.dyn_speed_thresh = float(gp('dyn_speed_thresh', 0.5))  # [m/s]
+
+        # ---- wall clamping (per-sample clamp + PCHIP refit) -----------------
+        self.clamp_to_walls = bool(gp('clamp_to_walls', True))
+        self.clamp_buffer   = float(gp('clamp_buffer',  0.05))     # [m]
 
         # ---- Frenet state ---------------------------------------------------
         self._sx = None
@@ -435,20 +438,25 @@ class LocalPlanning(Node):
         return max(2, int(self.local_horizon / self.ds_step) + 1)
 
     def _make_local_wpnts(self, target_fn, v_cap=None, use_curvature_cap=False,
-                          vx_scale=1.0):
-        """Unified builder: target d(s) + ego cosine blend + vx selection.
+                          vx_scale=1.0, use_blend=True):
+        """Unified builder: target d(s) + (optional) ego cosine blend + vx.
 
-        d(s) = target_fn(s) + (ego_d - target_fn(ego_s)) * cos_alpha(s_off),
-               cos_alpha = 1 at s_off=0, 0 at s_off >= s_blend.
-        First waypoint = ego actual position; merges into target by s_blend.
+        With use_blend=True (default, raceline/trailing):
+            d(s) = target_fn(s) + (ego_d - target_fn(ego_s)) * cos_alpha(s_off)
+        With use_blend=False (spline_avoid): d(s) = target_fn(s) — the
+        precomputed avoidance spline is published as-is, so what PP sees
+        matches the candidate visualization.
 
         vx = min( raceline PCHIP vx,
                   v_cap (if given, scalar from trailing),
                   sqrt(a_lat_max / |kappa|) (if use_curvature_cap) ).
         """
         n = self._n_pts()
-        target_at_ego = float(target_fn(self.ego_s))
-        delta = self.ego_d - target_at_ego
+        if use_blend:
+            target_at_ego = float(target_fn(self.ego_s))
+            delta = self.ego_d - target_at_ego
+        else:
+            delta = 0.0
 
         # (s, d) sequence
         s_arr = np.empty(n)
@@ -456,12 +464,15 @@ class LocalPlanning(Node):
         for k in range(n):
             s = (self.ego_s + k * self.ds_step) % self.s_total
             d_target = float(target_fn(s))
-            s_off = k * self.ds_step
-            if s_off >= self.s_blend:
+            if not use_blend:
                 d = d_target
             else:
-                alpha = 0.5 * (1.0 + math.cos(math.pi * s_off / self.s_blend))
-                d = d_target + delta * alpha
+                s_off = k * self.ds_step
+                if s_off >= self.s_blend:
+                    d = d_target
+                else:
+                    alpha = 0.5 * (1.0 + math.cos(math.pi * s_off / self.s_blend))
+                    d = d_target + delta * alpha
             s_arr[k] = s
             d_arr[k] = d
 
@@ -522,11 +533,12 @@ class LocalPlanning(Node):
         return self._make_local_wpnts(target_fn=lambda s: 0.0, v_cap=v_cap)
 
     def _build_from_avoid_state(self, st):
-        """Committed avoidance spline as target + ego blend + curvature vx cap."""
+        """Publish the committed avoidance spline as-is (no ego blend)."""
         return self._make_local_wpnts(
             target_fn=lambda s: self._avoid_d_at(s, st),
             use_curvature_cap=True,
-            vx_scale=self.vx_scale_avoid)
+            vx_scale=self.vx_scale_avoid,
+            use_blend=False)
 
     def _build_spline_avoid_or_fallback(self):
         """Spline avoidance with hysteresis and trailing fallback.
@@ -549,7 +561,7 @@ class LocalPlanning(Node):
                 self._avoid_state = None
                 self._clear_candidates()
             else:
-                self._clear_candidates()
+                # Keep the committed candidate visible until ego passes s_d.
                 return self._build_from_avoid_state(st), 'spline_avoid'
 
         # (B) not committed -> try new avoidance
@@ -583,8 +595,8 @@ class LocalPlanning(Node):
 
         # evaluate left/right candidates
         s_obs_rel = self.ego_s + gap   # monotone (wrap-aware)
-        cand_left  = self._make_avoidance_state(s_obs_rel, +self.d_safe, 'left')
-        cand_right = self._make_avoidance_state(s_obs_rel, -self.d_safe, 'right')
+        cand_left  = self._make_avoidance_state(s_obs_rel, +self.d_safe, 'left',  d_obs)
+        cand_right = self._make_avoidance_state(s_obs_rel, -self.d_safe, 'right', d_obs)
 
         results = []
         for st in (cand_left, cand_right):
@@ -610,12 +622,22 @@ class LocalPlanning(Node):
     # ================================================================== #
     # Avoidance state + feasibility
     # ================================================================== #
-    def _make_avoidance_state(self, s_obs_rel, d_avoid, label):
-        """3-control-point cubic spline (bc_type='natural').
+    def _make_avoidance_state(self, s_obs_rel, d_avoid, label, d_obs=0.0):
+        """3-ctrl cubic spline, then push samples out of obstacle + clamp to
+        walls + PCHIP refit.
 
         ctrl points: (ego_s_init, ego_d_init), (s_obs_rel, d_avoid),
                      (s_obs_rel + s_out, 0).
         s_d = last ctrl = commit termination check point.
+
+        Post-processing (clamp_to_walls):
+          1. dense-sample the raw cubic over [ego_s_init, s_d]
+          2. push d laterally so |d - d_obs| >= sqrt(safety^2 - (s - s_obs)^2)
+             on the side selected by sign(d_avoid)        (obstacle clearance)
+          3. clamp each d into [-dr(s)+margin+buffer, dl(s)-margin-buffer]
+             (wall clearance — final, so walls win over obstacle push if they
+             collide; _evaluate_state then catches that as infeasible)
+          4. refit with PCHIP (shape-preserving, no overshoot)
         """
         ego_s_init = float(self.ego_s)
         ego_d_init = float(self.ego_d)
@@ -624,7 +646,38 @@ class LocalPlanning(Node):
         d_ctrl = np.array([ego_d_init, float(d_avoid), 0.0], dtype=float)
         if not np.all(np.diff(s_ctrl) > 1e-3):
             return None
-        cs = CubicSpline(s_ctrl, d_ctrl, bc_type='natural')
+        cs_raw = CubicSpline(s_ctrl, d_ctrl, bc_type='natural')
+
+        if self.clamp_to_walls:
+            n_clamp = 40
+            s_seq = np.linspace(ego_s_init, s_d, n_clamp)
+            d_seq = np.asarray(cs_raw(s_seq), dtype=float)
+            inset  = self.margin + self.clamp_buffer
+            safety = self.obs_radius + self.margin
+            side = 1.0 if d_avoid > 0 else -1.0
+            for i, s in enumerate(s_seq):
+                d = d_seq[i]
+                # 1) push outward of obstacle within its s-influence band
+                ds_obs = s - s_obs_rel
+                if abs(ds_obs) < safety:
+                    lat_needed = math.sqrt(safety * safety - ds_obs * ds_obs)
+                    target = d_obs + side * lat_needed
+                    if side > 0:
+                        d = max(d, target)
+                    else:
+                        d = min(d, target)
+                # 2) wall clamp (final authority)
+                dl =  self._dl_at(s) - inset
+                dr = -self._dr_at(s) + inset
+                if dl < dr:                       # corridor narrower than 2*inset
+                    d = 0.5 * (dl + dr)
+                else:
+                    d = min(max(d, dr), dl)
+                d_seq[i] = d
+            cs = PchipInterpolator(s_seq, d_seq, extrapolate=False)
+        else:
+            cs = cs_raw
+
         return {
             'label':       label,
             'd_avoid':     float(d_avoid),
@@ -731,7 +784,10 @@ class LocalPlanning(Node):
                 x, y = self.to_cartesian(s, d)
                 p = Point(); p.x, p.y, p.z = float(x), float(y), 0.07
                 m.points.append(p)
-            m.lifetime.nanosec = 300_000_000
+            # lifetime=0 -> persist in RViz until explicit DELETEALL.
+            # We only clear when ego passes s_d (avoidance complete).
+            m.lifetime.sec = 0
+            m.lifetime.nanosec = 0
             ma.markers.append(m)
         self.cand_pub.publish(ma)
 
